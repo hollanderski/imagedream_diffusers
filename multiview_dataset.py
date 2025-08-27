@@ -18,9 +18,47 @@ import torchvision.transforms as transforms
 from einops import rearrange
 
 from mv_unet import get_camera
+from EEGNet_Embedding_version import EEGNet_Embedding
 
 
 
+
+def sliding_window_data(data, labels, fs, window_length, overlap):
+    """
+    Segments data into epochs using a sliding window approach.
+
+    Parameters:
+    - data: np.array, shape (num_trials, num_channels, num_samples)
+    - labels: np.array, shape (num_trials,)
+    - fs: int, Sampling frequency (samples per second)
+    - window_length: float, Length of each window in seconds
+    - overlap: float, Overlap between consecutive windows (in range [0, 1])
+
+    Returns:
+    - segmented_data: np.array, shape (num_windows_total, num_channels, samples_per_window)
+    - segmented_labels: np.array, shape (num_windows_total,)
+    """
+    samples_per_window = int(fs * window_length)  # Number of samples per window
+    step_size = int(samples_per_window * (1 - overlap))  # Step size based on overlap
+
+    num_trials, num_channels, num_samples = data.shape
+    num_windows_per_trial = (num_samples - samples_per_window) // step_size + 1
+    num_windows_total = num_trials * num_windows_per_trial
+
+    # Initialize arrays for segmented data and labels
+    segmented_data = np.zeros((num_windows_total, num_channels, samples_per_window))
+    segmented_labels = np.zeros(num_windows_total)
+
+    window_index = 0
+    for trial in range(num_trials):
+        for window in range(num_windows_per_trial):
+            start_sample = window * step_size
+            end_sample = start_sample + samples_per_window
+            segmented_data[window_index, :, :] = data[trial, :, start_sample:end_sample]
+            segmented_labels[window_index] = labels[trial]
+            window_index += 1
+
+    return segmented_data, segmented_labels 
 
 
 # Keep the original 4-channel normalize for backward compatibility if needed
@@ -166,11 +204,21 @@ class MultiViewEEGDataset():
             self.data = np.load(data_path / "data.npy", allow_pickle=True)
             self.labels = np.load(data_path / "group.npy", allow_pickle=True)
             self.trials = np.load(data_path / "trials.npy", allow_pickle=True)
+
         else:
             raise FileNotFoundError(f"Data path not found: {data_path}")
 
-        # Convert to torch tensors
-        self.data = torch.from_numpy(self.data).type(torch.float32).to(self.device)
+        # fs = 250  
+        # window_length = 8  # 8 seconds
+        # overlap = 0
+        
+        # self.data, self.labels = sliding_window_data(
+        #     self.data, self.labels, fs, window_length, overlap
+        # )
+        # Convert to torch tensors and reshape for EEGNet
+        self.data = torch.from_numpy(self.data).type(torch.float).unsqueeze(1).to(self.device)
+        self.data = self.data.permute(0, 2, 3, 1)
+        #self.data = torch.from_numpy(self.data).type(torch.float32)
         self.labels = torch.from_numpy(self.labels).type(torch.LongTensor).to(self.device)
         self.labels = self.labels - 1  # 0-indexed
         
@@ -178,6 +226,7 @@ class MultiViewEEGDataset():
         self.group_labels = df['group_label'].values        
         self.group_to_indices = {label: np.where(self.group_labels == label)[0] for label in np.unique(self.group_labels)}
         
+        print(len(self.data), len(self.labels), len(self.group_labels), len(self.trials))
         # Create camera embeddings if requested
         if self.camera_embeddings:
             self.camera_poses = self._create_camera_embeddings()
@@ -288,7 +337,7 @@ class MultiViewEEGDataset():
         group_label = self.labels[idx].item()
         trial_label = self.trials[idx].item()
         
-        # Parse trial label exactly as in your original code
+        # Parse trial label 
         my_class = int(str(trial_label)[0])
         my_trial = int(str(trial_label)[1:-1]) - 1
         
@@ -554,6 +603,40 @@ def create_multiview_dataloader(
         view_selection=view_selection,
         preload_images=False, #True
     )
+
+    # eeg_features_dim :  need to instantiate?
+    sample_eeg = dataset[0]['eeg']  # Get one EEG sample
+    eeg_features = EEGNet_Embedding(sample_eeg.unsqueeze(0))
+    print(f"EEG features shape: {eeg_features.shape}")  
+
+    # checkpoint_path =   "G:/ninon_workspace/imagery2024/P12_61ch_8s_61test.ckpt"
+    #     checkpoint = torch.load(checkpoint_path, map_location=device)
+    #     hyper_parameters = checkpoint['hyper_parameters']
+    #     fs = 512
+    #     window_length = hyper_parameters['window_time']
+    #     train_overlap = 0
+    #     val_overlap = 0
+    #     batch_size = hyper_parameters['batch_size']
+
+    #     self.eeg_encoder = EEGNet_Embedding( 
+    #         in_chans=61,
+    #         n_classes = 6,
+    #         input_window_samples=fs*window_length,  
+    #         F1=hyper_parameters["F1"],  
+    #         F2=hyper_parameters["F1"] * hyper_parameters["D"],  
+    #         D=hyper_parameters["D"],   
+    #         kernel_length=hyper_parameters["kernel_length"],  
+    #         depthwise_kernel_length=hyper_parameters["depthwise_kernel_length"],  
+    #         lr=hyper_parameters["lr"],
+    #         epochs=hyper_parameters["epochs"],
+    #         weight_decay=hyper_parameters["weight_decay"],
+    #         drop_prob=hyper_parameters["drop_prob"],
+    #         pool_mode=hyper_parameters["pool_mode"], 
+    #         separable_kernel_length=hyper_parameters["separable_kernel_length"],
+    #         momentum=hyper_parameters["bn_momentum"],
+    #         activation=hyper_parameters["activation"], 
+    #         final_conv_length="auto", 
+    #     )
     
     return DataLoader(
         dataset,

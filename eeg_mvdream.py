@@ -16,6 +16,9 @@ from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 from pathlib import Path
 import sys
+import torch.nn as nn
+from EEGNet_Embedding_version import EEGNet_Embedding
+
 
 sys.path.append('G:/ninon_workspace/imagery2024/2D_Reconstruction/Generation_2D/reconstruction/code')
 sys.path.append('G:/ninon_workspace/imagery2024/3D_Reconstruction/imagedream-eeg/extern/ImageDream')
@@ -118,6 +121,40 @@ class MVDreamLoRATrainer:
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+
+        # EEG conditioning 
+        checkpoint_path =   "G:/ninon_workspace/imagery2024/Classification/explainability/checkpoints/object/P12-new.ckpt"
+        checkpoint = torch.load(checkpoint_path) #, map_location=device)
+        hyper_parameters = checkpoint['hyper_parameters']
+        fs = 512
+        window_length = hyper_parameters['window_time']
+        train_overlap = 0
+        val_overlap = 0
+        batch_size = hyper_parameters['batch_size']
+
+        self.eeg_encoder = EEGNet_Embedding( 
+            in_chans=61,
+            n_classes = 6,
+            input_window_samples=fs*window_length,  
+            F1=hyper_parameters["F1"],  
+            F2=hyper_parameters["F1"] * hyper_parameters["D"],  
+            D=hyper_parameters["D"],   
+            kernel_length=hyper_parameters["kernel_length"],  
+            depthwise_kernel_length=hyper_parameters["depthwise_kernel_length"],  
+            lr=hyper_parameters["lr"],
+            epochs=hyper_parameters["epochs"],
+            weight_decay=hyper_parameters["weight_decay"],
+            drop_prob=hyper_parameters["drop_prob"],
+            pool_mode=hyper_parameters["pool_mode"], 
+            separable_kernel_length=hyper_parameters["separable_kernel_length"],
+            momentum=hyper_parameters["bn_momentum"],
+            activation=hyper_parameters["activation"], 
+            final_conv_length="auto", 
+        )
+
+        self.eeg_encoder.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        eeg_features_dim = 512
+        self.eeg_projector = nn.Linear(eeg_features_dim, 1024)  # Match CLIP text embedding dim
         
         # Initialize accelerator
         self.accelerator = Accelerator(
@@ -183,6 +220,8 @@ class MVDreamLoRATrainer:
         self.pipeline.text_encoder.to(device)
         self.pipeline.vae.to(device)
         self.pipeline.image_encoder.to(device) 
+        self.eeg_encoder.to(device)  
+        self.eeg_projector.to(device) 
         
         # Prepare everything with accelerator
         (
@@ -244,7 +283,18 @@ class MVDreamLoRATrainer:
         
         # Get text embeddings (dummy for now)
         text_embeddings = self.get_text_embeddings(batch_size, device)
-        
+
+        # Replace text embeddings by eeg embeddings:
+        eeg_signals = batch['eeg'].to(device)  # [B, channels, time] 
+        with torch.no_grad():
+            eeg_features = self.eeg_encoder(eeg_signals, return_embedding=True)  # [B, eeg_features_dim]
+        eeg_embeddings = self.eeg_projector(eeg_features)  # [B, 768]
+        #eeg_embeddings = self.eeg_projector(eeg_features).unsqueeze(1)  # [B, 1, 768]
+        # Expand to match text sequence length: [B, 77, 768]
+        eeg_embeddings = eeg_embeddings.unsqueeze(1).repeat(1, 77, 1)  # [B, 77, 768]
+        eeg_embeddings_expanded = eeg_embeddings.unsqueeze(1).repeat(1, num_views, 1, 1)  # [B, V, 77, 768]
+        eeg_embeddings_flat = eeg_embeddings_expanded.view(-1, *eeg_embeddings.shape[1:])  # [B*V, 77, 768]
+
         # Encode images to latents
         target_latents = self.encode_images_to_latents(images)  # [B, V, C, H, W]
         target_latents_flat = target_latents.view(-1, *target_latents.shape[2:])  # [B*V, C, H, W]
@@ -312,7 +362,7 @@ class MVDreamLoRATrainer:
         unet_inputs = {
             'x': noisy_latents,
             'timesteps': timesteps,
-            'context': text_embeddings_flat,
+            'context': eeg_embeddings_flat, #text_embeddings_flat,
             'num_frames': num_views,
             'camera': camera_flat,
             'ip': ip_embeddings.repeat_interleave(num_views, dim=0),
@@ -364,7 +414,7 @@ class MVDreamLoRATrainer:
         # Initialize tracking
         if self.use_wandb and self.accelerator.is_main_process:
             self.accelerator.init_trackers(
-                project_name="mvdream-lora-finetune",
+                project_name="eeg-mvdream-lora-finetune",
                 config={
                     "learning_rate": self.learning_rate,
                     "num_train_epochs": self.num_train_epochs,
@@ -438,7 +488,8 @@ class MVDreamLoRATrainer:
         if self.use_wandb and self.accelerator.is_main_process:
             self.accelerator.end_training()
 
-    def generate_sample(self, step, num_samples=1):
+
+    def generate_sample(self, step, num_samples=10):
         """Generate sample images for validation from both train and val sets"""
         self.pipeline.unet.eval()
         
@@ -448,44 +499,54 @@ class MVDreamLoRATrainer:
         
         for dataset_name, dataloader in datasets_to_test:
             with torch.no_grad():
-                sample_batch = next(iter(dataloader))
-                conditioning_image = sample_batch['images'][0, 0]
+                sample_indices = torch.randperm(len(dataloader.dataset))[:num_samples]
+                for i, idx in enumerate(sample_indices):
+                    sample = dataloader.dataset[idx]
+                    # Convert single sample to batch format
+                    sample_batch = {k: v.unsqueeze(0) if torch.is_tensor(v) else [v] 
+                                for k, v in sample.items()}
+                    
+                    conditioning_image = sample_batch['images'][0, 0]
+
+                # sample_batch = next(iter(dataloader))
+                # conditioning_image = sample_batch['images'][0, 0]
                 
-                cond_img_np = conditioning_image.cpu().numpy().transpose(1, 2, 0)
-                cond_img_np = (cond_img_np + 1) / 2
-                
-                generated_images = self.pipeline(
-                    prompt="a 3D object",
-                    image=cond_img_np,
-                    height=256,
-                    width=256,
-                    num_inference_steps=20,
-                    guidance_scale=7.0,
-                    num_frames=4,
-                    output_type="numpy"
-                )
-                
-                # Save with dataset name in filename
-                import matplotlib.pyplot as plt
-                fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-                
-                axes[0].imshow(cond_img_np)
-                axes[0].set_title(f"Input ({dataset_name})")
-                axes[0].axis('off')
-                
-                for i in range(4):
-                    axes[i+1].imshow(generated_images[i])
-                    axes[i+1].set_title(f"Generated View {i}")
-                    axes[i+1].axis('off')
-                
-                plt.tight_layout()
-                save_path = os.path.join(self.output_dir, f"sample_{dataset_name}_step_{step}.png")
-                plt.savefig(save_path, dpi=150, bbox_inches='tight')
-                plt.close()
-                
-                print(f"{dataset_name.capitalize()} sample saved to {save_path}")
-        
-        self.pipeline.unet.train()
+                    cond_img_np = conditioning_image.cpu().numpy().transpose(1, 2, 0)
+                    cond_img_np = (cond_img_np + 1) / 2
+                    
+                    generated_images = self.pipeline(
+                        prompt="a 3D object",
+                        image=cond_img_np,
+                        height=256,
+                        width=256,
+                        num_inference_steps=20,
+                        guidance_scale=7.0,
+                        num_frames=4,
+                        output_type="numpy"
+                    )
+                    
+                    # Save with dataset name in filename
+                    import matplotlib.pyplot as plt
+                    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+                    
+                    axes[0].imshow(cond_img_np)
+                    axes[0].set_title(f"Input ({dataset_name})")
+                    axes[0].axis('off')
+                    
+                    for i in range(4):
+                        axes[i+1].imshow(generated_images[i])
+                        axes[i+1].set_title(f"Generated View {i}")
+                        axes[i+1].axis('off')
+                    
+                    plt.tight_layout()
+                    save_path = os.path.join(self.output_dir, f"sample_{dataset_name}_idx{idx}_step_{step}.png")
+                    #save_path = os.path.join(self.output_dir, f"sample_{dataset_name}_step_{step}.png")
+                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    
+                    print(f"{dataset_name.capitalize()} sample saved to {save_path}")
+            
+            self.pipeline.unet.train()
 
     def generate_sample_train_only(self, step, num_samples=1):
         """Generate sample images for validation"""
@@ -592,6 +653,7 @@ def multiview_collate_fn_grey(batch):
     # Stack all samples
     images = torch.stack(images_list)  # [B, V, C, H, W]
     classes = torch.tensor([item['class'] for item in batch])
+    eeg_signals = torch.stack([item['eeg'] for item in batch]) # should replicate for each image of trials?
     
     # Handle camera poses
     camera_poses = None
@@ -601,6 +663,7 @@ def multiview_collate_fn_grey(batch):
     return {
         'images': images,
         'classes': classes,
+        'eeg': eeg_signals,
         'camera_poses': camera_poses,
         'num_views': images.shape[1],
         'batch_size': images.shape[0]
