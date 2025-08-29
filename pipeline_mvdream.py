@@ -555,3 +555,183 @@ class MVDreamPipeline(DiffusionPipeline):
             self.final_offload_hook.offload()
 
         return image
+    
+    @torch.no_grad()
+    def __call_eeg__(
+        self,
+        conditioning_image: np.ndarray, 
+        eeg_signal: torch.Tensor,
+        eeg_encoder,
+        eeg_projector,
+        height: int = 256,
+        width: int = 256,
+        elevation: float = 0,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.0,
+        num_frames: int = 4,
+        device=torch.device("cuda:0"),
+    ):
+        self.unet = self.unet.to(device=device)
+        self.vae = self.vae.to(device=device)
+        
+        do_classifier_free_guidance = guidance_scale > 1.0
+        batch_size = 1  # Single sample
+        
+        # Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+        
+        # Get EEG embeddings, match training logic
+        eeg_features = eeg_encoder(eeg_signal.unsqueeze(0).to(device), return_embedding=True)
+        eeg_embeddings = eeg_projector(eeg_features)  # [1, 1024]
+        eeg_embeddings = eeg_embeddings.unsqueeze(1).repeat(1, 77, 1)  # [1, 77, 1024]
+        eeg_embeddings_expanded = eeg_embeddings.unsqueeze(1).repeat(1, num_frames, 1, 1)  # [1, 4, 77, 1024]
+        eeg_embeddings_flat = eeg_embeddings_expanded.view(-1, *eeg_embeddings.shape[1:])  # [4, 77, 1024]
+        
+        # Create zero image embeddings - match training shape
+        # ip_embeddings = torch.zeros(batch_size, 257, 1280, device=device, dtype=eeg_embeddings_flat.dtype)
+        # ip_img_latents = torch.zeros(batch_size, 4, height//8, width//8, device=device, dtype=eeg_embeddings_flat.dtype)
+
+        # guide with image
+        # ip_embeddings = self.encode_image(conditioning_image.astype(np.float32), device, 1)[1]
+    
+        # ip_img_latents = self.encode_image_latents(conditioning_image, device, 1)[1]
+
+        # ip_embeddings = ip_embeddings * 0.05  # Minimal image conditioning
+        
+        # Prepare latents
+        latents = self.prepare_latents(
+            num_frames, 4, height, width,
+            eeg_embeddings_flat.dtype, device, None, None,
+        )
+        
+        # Get camera
+        camera = get_camera(num_frames, elevation=elevation, extra_view=False, blender_coord=False).to(dtype=latents.dtype, device=device)
+        
+        # Denoising loop
+        for i, t in enumerate(timesteps):
+            latent_model_input = latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            
+            unet_inputs = {
+                'x': latent_model_input,
+                'timesteps': torch.tensor([t] * num_frames, dtype=latent_model_input.dtype, device=device),
+                'context': eeg_embeddings_flat,  # [4, 77, 1024]
+                'num_frames': num_frames,
+                'camera': camera,  # [4, 16]
+                # 'ip': ip_embeddings.repeat_interleave(num_frames, dim=0),  # [4, 257, 1280] 
+                # 'ip_img': ip_img_latents,  # [1, 4, 32, 32]
+            }
+            
+            noise_pred = self.unet.forward(**unet_inputs)
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        
+        # Decode latents
+        images = self.decode_latents(latents)
+        return images
+    
+    @torch.no_grad()
+    def __call_eeg__old(
+        self,
+        eeg_signal: torch.Tensor,
+        eeg_encoder,
+        eeg_projector,
+        height: int = 256,
+        width: int = 256,
+        elevation: float = 0,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.0,
+        num_frames: int = 4,
+        device=torch.device("cuda:0"),
+    ):
+        self.unet = self.unet.to(device=device)
+        self.vae = self.vae.to(device=device)
+        
+        do_classifier_free_guidance = guidance_scale > 1.0
+        
+        # Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+        
+        # Get EEG embeddings (replicate your training logic)
+        eeg_features = eeg_encoder(eeg_signal.unsqueeze(0).to(device), return_embedding=True)
+        eeg_embeddings = eeg_projector(eeg_features)
+        #eeg_context = eeg_embeddings.unsqueeze(1).repeat(1, 77, 1)  # [1, 77, 1024]
+
+        eeg_context = eeg_embeddings.unsqueeze(1).repeat(1, 77, 1)  # [1, 77, 1024]
+        
+        # Create negative embeddings for CFG
+        if do_classifier_free_guidance:
+            negative_context = torch.zeros_like(eeg_context)
+            prompt_embeds_neg = negative_context
+            prompt_embeds_pos = eeg_context
+        else:
+            prompt_embeds_pos = eeg_context
+        
+        # Ensure proper expansion for multiple frames:
+        if do_classifier_free_guidance:
+            context = torch.cat([negative_context] * num_frames + [eeg_context] * num_frames, dim=0)  # [8, 77, 1024]
+        else:
+            context = eeg_context.repeat(num_frames, 1, 1)  # [4, 77, 1024]
+
+        # Zero image conditioning for pure EEG generation
+        # image_embeds_neg = torch.zeros(num_frames, 1024, device=device, dtype=eeg_context.dtype)
+        # image_embeds_pos = torch.zeros(num_frames, 1024, device=device, dtype=eeg_context.dtype)
+        image_embeds_neg = torch.zeros(num_frames, 1280, device=device, dtype=eeg_context.dtype)
+        image_embeds_pos = torch.zeros(num_frames, 1280, device=device, dtype=eeg_context.dtype)
+
+        image_latents_neg = torch.zeros(1, 4, height//8, width//8, device=device, dtype=eeg_context.dtype)
+        image_latents_pos = torch.zeros(1, 4, height//8, width//8, device=device, dtype=eeg_context.dtype)
+
+
+        # Prepare latents
+        actual_num_frames = num_frames
+        latents = self.prepare_latents(
+            actual_num_frames, 4, height, width,
+            prompt_embeds_pos.dtype, device, None, None,
+        )
+
+        if do_classifier_free_guidance:
+            ip_tensor = torch.cat([
+                image_embeds_neg.repeat(actual_num_frames, 1),  # [num_frames, 1280]
+                image_embeds_pos.repeat(actual_num_frames, 1)   # [num_frames, 1280] 
+            ], dim=0)  # [2*num_frames, 1280]
+        else:
+            ip_tensor = image_embeds_pos.repeat(actual_num_frames, 1)  # [num_frames, 1280]
+
+        print(f"Validation - context shape: {context.shape}")
+        print(f"Validation - ip shape: {ip_tensor.shape}")
+
+
+        
+        # Get camera
+        camera = get_camera(num_frames, elevation=elevation, extra_view=False).to(dtype=latents.dtype, device=device)
+        
+        
+        # Denoising loop
+        for i, t in enumerate(timesteps):
+            multiplier = 2 if do_classifier_free_guidance else 1
+            latent_model_input = torch.cat([latents] * multiplier)
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            
+            unet_inputs = {
+                'x': latent_model_input,
+                'timesteps': torch.tensor([t] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device=device),
+                'context': context, # torch.cat([prompt_embeds_neg] * actual_num_frames + [prompt_embeds_pos] * actual_num_frames) if do_classifier_free_guidance else prompt_embeds_pos.repeat(actual_num_frames, 1, 1),
+                'num_frames': actual_num_frames,
+                'camera': torch.cat([camera] * multiplier),
+                'ip': ip_tensor, #torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames),
+                'ip_img': torch.cat([image_latents_neg, image_latents_pos]),
+            }
+            
+            noise_pred = self.unet.forward(**unet_inputs)
+            
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        
+        # Decode latents
+        images = self.decode_latents(latents)
+        return images
