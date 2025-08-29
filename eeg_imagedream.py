@@ -13,7 +13,7 @@ import wandb
 from tqdm import tqdm
 import argparse
 from accelerate import Accelerator
-from peft import LoraConfig, get_peft_model, PeftModel
+from peft import LoraConfig, get_peft_model
 from pathlib import Path
 import sys
 import torch.nn as nn
@@ -93,7 +93,7 @@ class MVDreamLoRATrainer:
         num_train_epochs: int = 10,
         gradient_accumulation_steps: int = 1,
         mixed_precision: str = "fp16",
-        output_dir: str = "./eeg_mvdream_lora",
+        output_dir: str = "./mvdream_lora",
         logging_dir: str = "./logs",
         save_steps: int = 500,
         validation_steps: int = 100,
@@ -169,7 +169,6 @@ class MVDreamLoRATrainer:
         
         # Setup model for training
         self.setup_training()
-        #self.load_checkpoint_if_exists() 
         
     def setup_training(self):
         """Setup LoRA model, optimizer, and scheduler"""
@@ -220,6 +219,7 @@ class MVDreamLoRATrainer:
         device = self.accelerator.device
         self.pipeline.text_encoder.to(device)
         self.pipeline.vae.to(device)
+        self.pipeline.image_encoder.to(device) 
         self.eeg_encoder.to(device)  
         self.eeg_projector.to(device) 
         
@@ -238,45 +238,7 @@ class MVDreamLoRATrainer:
         
         if self.val_dataloader is not None:
             self.val_dataloader = self.accelerator.prepare(self.val_dataloader)
-
-        self.resume_step = self.load_checkpoint_if_exists()
     
-    def load_checkpoint_if_exists(self, checkpoint_path=None):
-        """Load LoRA checkpoint if it exists"""
-        if checkpoint_path is None:
-            # Look for the latest checkpoint in output_dir
-            checkpoint_dirs = [d for d in os.listdir(self.output_dir) 
-                            if d.startswith('checkpoint-') and d != 'checkpoint-final']
-            if not checkpoint_dirs:
-                print("No checkpoint found, starting from scratch")
-                return 0
-                
-            # Get the latest checkpoint by step number
-            latest_step = max([int(d.split('-')[1]) for d in checkpoint_dirs])
-            checkpoint_path = os.path.join(self.output_dir, f"checkpoint-{latest_step}")
-        
-        if os.path.exists(checkpoint_path):
-            print(f"Loading checkpoint from {checkpoint_path}")
-            
-            # Load LoRA weights into UNet
-            self.pipeline.unet = PeftModel.from_pretrained(
-                self.pipeline.unet, 
-                checkpoint_path,
-                is_trainable=True
-            )
-            
-            # Load training state (optimizer, scheduler, etc.)
-            self.accelerator.load_state(checkpoint_path)
-            
-            # Extract step number from checkpoint path
-            step = int(checkpoint_path.split('-')[-1]) if checkpoint_path.split('-')[-1].isdigit() else 0
-            print(f"Resumed from step {step}")
-            return step
-        else:
-            print(f"Checkpoint path {checkpoint_path} does not exist")
-            return 0
-    
-
     def encode_images_to_latents(self, images):
         """Encode images to latent space using VAE"""
         batch_size, num_views = images.shape[:2]
@@ -338,6 +300,26 @@ class MVDreamLoRATrainer:
                                 (batch_size * num_views,), device=device).long()
         noisy_latents = self.pipeline.scheduler.add_noise(target_latents_flat, noise, timesteps)
         
+        # Camera and image conditioning (gradually reduce image influence)
+        conditioning_images = images[:, 0]
+        with torch.no_grad():
+            ip_embeddings = self.pipeline.encode_image(
+                conditioning_images.cpu().numpy().transpose(0, 2, 3, 1), device, 1)[1]
+            ip_img_latents_list = []
+            for i in range(batch_size):
+                single_img = conditioning_images[i].cpu().numpy().transpose(1, 2, 0)
+                latent = self.pipeline.encode_image_latents(single_img, device, 1)[1]
+                ip_img_latents_list.append(latent)
+            ip_img_latents = torch.cat(ip_img_latents_list, dim=0)
+        
+        # Progressive masking
+        training_progress = current_step / max_steps if max_steps > 0 else 0
+        mask_strength = min(training_progress * 2, 0.95)  # Cap at 95% to maintain some guidance
+        
+        if torch.rand(1) < mask_strength:
+            ip_embeddings = ip_embeddings * (1 - mask_strength)  # Gradual reduction instead of zeros
+            ip_img_latents = ip_img_latents * (1 - mask_strength)
+        
         # Get camera poses
         camera_batch = []
         for _ in range(batch_size):
@@ -354,8 +336,8 @@ class MVDreamLoRATrainer:
             'context': eeg_embeddings_flat,  # EEG conditioning
             'num_frames': num_views,
             'camera': camera_flat,
-            # 'ip': ip_embeddings.repeat_interleave(num_views, dim=0),
-            # 'ip_img': ip_img_latents,
+            'ip': ip_embeddings.repeat_interleave(num_views, dim=0),
+            'ip_img': ip_img_latents,
         }
         
         predicted_noise = self.pipeline.unet(**unet_inputs)
@@ -363,30 +345,142 @@ class MVDreamLoRATrainer:
         # Combined loss: denoising + EEG-image alignment
         denoising_loss = F.mse_loss(predicted_noise, noise, reduction='mean')
         
-        # predicted_noise = self.pipeline.unet(**unet_inputs)
-        # loss = F.mse_loss(predicted_noise, noise, reduction='mean')
-        
-        # Add CLIP perceptual loss
-        if current_step > 500:  # Start after initial training
+        # Add EEG-image reconstruction loss
+        if training_progress > 0.3:  # Start EEG reconstruction loss after 30% training
+            # Generate clean prediction for reconstruction loss
             with torch.no_grad():
-                # Decode generated and target images
-                generated_latents = target_latents_flat - predicted_noise  # Approximate clean prediction
-                generated_images = self.pipeline.vae.decode(generated_latents / self.pipeline.vae.config.scaling_factor).sample
-                target_images_decoded = self.pipeline.vae.decode(target_latents_flat / self.pipeline.vae.config.scaling_factor).sample
+                clean_prediction = self.pipeline.unet(**{
+                    **unet_inputs,
+                    'x': target_latents_flat,  # Use clean latents
+                    'timesteps': torch.zeros_like(timesteps)  # No noise timestep
+                })
                 
-                # CLIP similarity loss
-                gen_features = self.pipeline.image_encoder((generated_images + 1) / 2).pooler_output
-                target_features = self.pipeline.image_encoder((target_images_decoded + 1) / 2).pooler_output
-                
-                perceptual_loss = 1 - F.cosine_similarity(gen_features, target_features, dim=-1).mean()
-                total_loss = denoising_loss + 0.1 * perceptual_loss
+            # Reconstruction loss between EEG-predicted and target latents
+            reconstruction_loss = F.mse_loss(clean_prediction, target_latents_flat, reduction='mean')
+            total_loss = denoising_loss + 0.1 * reconstruction_loss  # Weight the reconstruction component
         else:
             total_loss = denoising_loss
         
         return total_loss
-        #return loss
+    
+    def compute_loss_old(self, batch, current_step=0, max_steps=1):
+        """Compute the training loss"""
+        device = self.accelerator.device
+        
+        # Move batch to device
+        images = batch['images'].to(device)  # [B, V, C, H, W]
+        batch_size = images.shape[0]
+        num_views = images.shape[1]
+        
+        # Get text embeddings (dummy for now)
+        text_embeddings = self.get_text_embeddings(batch_size, device)
 
+        # Replace text embeddings by eeg embeddings:
+        eeg_signals = batch['eeg'].to(device)  # [B, channels, time] 
+        with torch.no_grad():
+            eeg_features = self.eeg_encoder(eeg_signals, return_embedding=True)  # [B, eeg_features_dim]
+        eeg_embeddings = self.eeg_projector(eeg_features)  # [B, 768]
+        #eeg_embeddings = self.eeg_projector(eeg_features).unsqueeze(1)  # [B, 1, 768]
+        # Expand to match text sequence length: [B, 77, 768]
+        eeg_embeddings = eeg_embeddings.unsqueeze(1).repeat(1, 77, 1)  # [B, 77, 768]
+        eeg_embeddings_expanded = eeg_embeddings.unsqueeze(1).repeat(1, num_views, 1, 1)  # [B, V, 77, 768]
+        eeg_embeddings_flat = eeg_embeddings_expanded.view(-1, *eeg_embeddings.shape[1:])  # [B*V, 77, 768]
 
+        # Encode images to latents
+        target_latents = self.encode_images_to_latents(images)  # [B, V, C, H, W]
+        target_latents_flat = target_latents.view(-1, *target_latents.shape[2:])  # [B*V, C, H, W]
+
+        
+        
+        # Sample noise and timesteps
+        noise = torch.randn_like(target_latents_flat)
+        timesteps = torch.randint(
+            0, 
+            self.pipeline.scheduler.config.num_train_timesteps,
+            (batch_size * num_views,),
+            device=device
+        ).long()
+        
+        # Add noise to latents
+        noisy_latents = self.pipeline.scheduler.add_noise(target_latents_flat, noise, timesteps)
+        
+        # Get camera parameters
+        if 'camera_poses' in batch and batch['camera_poses'] is not None:
+            camera = batch['camera_poses'].to(device, dtype=noisy_latents.dtype)
+            camera_flat = camera.view(-1, camera.shape[-1])  # [B*V, camera_dim]
+            print("USING EXISTING CAMERA POSE")
+        else:
+            # Fallback to generated cameras
+            print("GENERATE GT CAMERA POSES")
+            camera_batch = []
+            for _ in range(batch_size):
+                #camera = get_camera(num_views, elevation=0.0, extra_view=False) was incorrect azimuth
+                all_cameras = get_camera(8, elevation=0.0, extra_view=False, blender_coord=False) # we have 8 images in total
+                selected_indices = [0, 2, 4, 6]  # Match multiview dataset uniform selection
+                camera_batch = []
+                for _ in range(batch_size):
+                    selected_cameras = all_cameras[selected_indices]
+                    camera_batch.append(selected_cameras)
+                #camera_batch.append(camera)
+            camera = torch.stack(camera_batch, dim=0).to(device, dtype=noisy_latents.dtype)
+            camera_flat = camera.view(-1, camera.shape[-1])  # [B*V, camera_dim]
+        
+        # Prepare text embeddings for each view
+        text_embeddings_expanded = text_embeddings.unsqueeze(1).repeat(1, num_views, 1, 1)  # [B, V, seq_len, hidden_dim]
+        text_embeddings_flat = text_embeddings_expanded.view(-1, *text_embeddings.shape[1:])  # [B*V, seq_len, hidden_dim]
+        
+        # For ImageDream: use first view as conditioning image
+        conditioning_images = images[:, 0]  # [B, C, H, W] - first view only
+    
+        # Encode conditioning image
+        with torch.no_grad():
+            # Get image embeddings (using CLIP image encoder)
+            ip_embeddings = self.pipeline.encode_image(
+                conditioning_images.cpu().numpy().transpose(0, 2, 3, 1),  # Convert to HWC format
+                device, 
+                1  # num_images_per_prompt
+            )[1]  # Get positive embeddings
+            
+            # Get conditioning image latents --> Single img only
+            ip_img_latents_list = []
+            for i in range(batch_size):
+                single_img = conditioning_images[i].cpu().numpy().transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
+                latent = self.pipeline.encode_image_latents(single_img, device, 1)[1]
+                ip_img_latents_list.append(latent)
+
+            ip_img_latents = torch.cat(ip_img_latents_list, dim=0)  # [B, C, H, W]
+
+        # Progressive masking of images
+        training_progress = current_step / max_steps if max_steps > 0 else 0
+        mask_probability = min(training_progress * 2, 1.0)  # Starts at 0, reaches 1 at 50% training
+
+        if torch.rand(1) < mask_probability:
+            # Zero out image conditioning
+            ip_embeddings = torch.zeros_like(ip_embeddings)
+            ip_img_latents = torch.zeros_like(ip_img_latents)
+
+        print(f"Training - context shape: {eeg_embeddings_flat.shape}")
+        print(f"Training - ip shape: {ip_embeddings.shape}")
+        print(f"Training - ip shape passed to context: {ip_embeddings.repeat_interleave(num_views, dim=0).shape}")
+
+        # Predict noise
+        unet_inputs = {
+            'x': noisy_latents,
+            'timesteps': timesteps,
+            'context': eeg_embeddings_flat, #text_embeddings_flat,
+            'num_frames': num_views,
+            'camera': camera_flat,
+            'ip': ip_embeddings.repeat_interleave(num_views, dim=0),
+            'ip_img': ip_img_latents,  # [B, C, H, W]
+        }
+        
+        predicted_noise = self.pipeline.unet(**unet_inputs)
+        
+        # Compute loss
+        loss = F.mse_loss(predicted_noise, noise, reduction='mean')
+        
+        return loss
+    
     def validation_step(self):
         """Perform validation"""
         if self.val_dataloader is None:
@@ -437,7 +531,7 @@ class MVDreamLoRATrainer:
             )
         
         # Training loop
-        global_step = getattr(self, 'resume_step', 0) 
+        global_step = 0
         self.pipeline.unet.train()
         
         for epoch in range(self.num_train_epochs):
@@ -503,71 +597,7 @@ class MVDreamLoRATrainer:
         if self.use_wandb and self.accelerator.is_main_process:
             self.accelerator.end_training()
 
-    def generate_sample(self, step, num_samples=1):
-        self.pipeline.unet.eval()
-        
-        with torch.no_grad():
-            sample_batch = next(iter(self.train_dataloader))
-            eeg_signal = sample_batch['eeg'][0]
-            
-            # Get GT for comparison
-            gt_image = sample_batch['images'][0, 0]
-            gt_img_np = gt_image.cpu().numpy().transpose(1, 2, 0)
-            gt_img_np = (gt_img_np + 1) / 2
-            
-            # Generate EEG embeddings exactly like training
-            device = next(self.pipeline.unet.parameters()).device
-            eeg_features = self.eeg_encoder(eeg_signal.unsqueeze(0).to(device), return_embedding=True)
-            eeg_embeddings = self.eeg_projector(eeg_features)
-            eeg_context = eeg_embeddings.unsqueeze(1).repeat(1, 77, 1)
-            
-            # Manual generation loop using your training setup
-            height, width, num_frames = 256, 256, 4
-            latents = torch.randn(num_frames, 4, height//8, width//8, device=device, dtype=eeg_context.dtype)
-            
-            # Use scheduler from training
-            self.pipeline.scheduler.set_timesteps(20, device=device)
-            
-            for t in self.pipeline.scheduler.timesteps:
-                # Same camera setup as training
-                camera = get_camera(8, elevation=0.0, extra_view=False, blender_coord=False)[[0,2,4,6]]
-                camera = camera.to(device, dtype=latents.dtype)
-                
-                # Same UNet inputs as training  
-                noise_pred = self.pipeline.unet(
-                    x=latents,
-                    timesteps=torch.tensor([t] * num_frames, device=device),
-                    context=eeg_context.repeat(num_frames, 1, 1),
-                    num_frames=num_frames,
-                    camera=camera
-                )
-                
-                latents = self.pipeline.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-            
-            # Decode
-            generated_images = self.pipeline.decode_latents(latents)
-            
-            # Save comparison
-            import matplotlib.pyplot as plt
-            fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-            
-            axes[0].imshow(gt_img_np)
-            axes[0].set_title("GT")
-            axes[0].axis('off')
-            
-            for i in range(4):
-                axes[i+1].imshow(generated_images[i])
-                axes[i+1].set_title(f"EEG Gen {i}")
-                axes[i+1].axis('off')
-            
-            plt.tight_layout()
-            save_path = os.path.join(self.output_dir, f"eeg_sample_step_{step}.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            plt.close()
-        
-        self.pipeline.unet.train()
-
-    def generate_sample_eeg(self, step, num_samples=10):
+    def generate_sample(self, step, num_samples=10):
         self.pipeline.unet.eval()
         
         for dataset_name, dataloader in [("train", self.train_dataloader)]:
@@ -835,7 +865,7 @@ def main():
     parser.add_argument("--val_dir", type=str, required=True, help="Path to EEG validation data (.npy file)")
     parser.add_argument("--test_dir", type=str, required=True, help="Path to EEG test data (.npy file)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to pretrained MVDream model")
-    parser.add_argument("--output_dir", type=str, default="./eeg_mvdream_lora", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./mvdream_lora", help="Output directory")
     parser.add_argument("--batch_size", type=int, default=2, help="Training batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
