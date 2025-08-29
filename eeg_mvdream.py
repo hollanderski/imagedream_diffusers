@@ -190,11 +190,12 @@ class MVDreamLoRATrainer:
             ],
             lora_dropout=self.lora_dropout,
         )
-        
+
+        #lora_config.inference_mode = False # !! important otherwise adapter is frozen
+
         # Apply LoRA to UNet
         self.pipeline.unet = get_peft_model(self.pipeline.unet, lora_config)
-        self.pipeline.unet.print_trainable_parameters()
-        
+
         # Setup optimizer - only LoRA parameters
         trainable_params = [p for p in self.pipeline.unet.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
@@ -204,18 +205,34 @@ class MVDreamLoRATrainer:
             weight_decay=0.01,
             eps=1e-08,
         )
-        
-        # Calculate total training steps
+
+         # Calculate total training steps
         num_update_steps_per_epoch = len(self.train_dataloader) // self.gradient_accumulation_steps
         max_train_steps = self.num_train_epochs * num_update_steps_per_epoch
-        
+            
         # Setup scheduler
         self.lr_scheduler = get_scheduler(
-            self.lr_scheduler_type,
-            optimizer=self.optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=max_train_steps,
+                self.lr_scheduler_type,
+                optimizer=self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=max_train_steps,
         )
+
+        resume = False
+
+        if resume:
+
+            ckpt = r"G:/ninon_workspace/imagedream_diffusers/eeg_mvdream_lora/checkpoint-1000"
+
+            # Load the LoRA adapter weights
+            self.pipeline.unet.load_adapter(ckpt, adapter_name="default", is_trainable=True)
+
+            # Restore optimizer and scheduler state
+            self.optimizer.load_state_dict(torch.load(os.path.join(ckpt, "optimizer.bin"), map_location="cpu"))
+            self.lr_scheduler.load_state_dict(torch.load(os.path.join(ckpt, "scheduler.bin"), map_location="cpu"))
+            #self.scaler.load_state_dict(torch.load(os.path.join(ckpt, "scaler.pt"), map_location="cpu"))
+            self.resume_step = 1000
+            #self.resume_step = self.load_checkpoint_if_exists()    
 
         device = self.accelerator.device
         self.pipeline.text_encoder.to(device)
@@ -239,7 +256,7 @@ class MVDreamLoRATrainer:
         if self.val_dataloader is not None:
             self.val_dataloader = self.accelerator.prepare(self.val_dataloader)
 
-        self.resume_step = self.load_checkpoint_if_exists()
+
     
     def load_checkpoint_if_exists(self, checkpoint_path=None):
         """Load LoRA checkpoint if it exists"""
@@ -363,28 +380,28 @@ class MVDreamLoRATrainer:
         # Combined loss: denoising + EEG-image alignment
         denoising_loss = F.mse_loss(predicted_noise, noise, reduction='mean')
         
-        # predicted_noise = self.pipeline.unet(**unet_inputs)
-        # loss = F.mse_loss(predicted_noise, noise, reduction='mean')
+        predicted_noise = self.pipeline.unet(**unet_inputs)
+        loss = F.mse_loss(predicted_noise, noise, reduction='mean')
         
         # Add CLIP perceptual loss
-        if current_step > 500:  # Start after initial training
-            with torch.no_grad():
-                # Decode generated and target images
-                generated_latents = target_latents_flat - predicted_noise  # Approximate clean prediction
-                generated_images = self.pipeline.vae.decode(generated_latents / self.pipeline.vae.config.scaling_factor).sample
-                target_images_decoded = self.pipeline.vae.decode(target_latents_flat / self.pipeline.vae.config.scaling_factor).sample
+        # if current_step > 500:  # Start after initial training
+        #     with torch.no_grad():
+        #         # Decode generated and target images
+        #         generated_latents = target_latents_flat - predicted_noise  # Approximate clean prediction
+        #         generated_images = self.pipeline.vae.decode(generated_latents / self.pipeline.vae.config.scaling_factor).sample
+        #         target_images_decoded = self.pipeline.vae.decode(target_latents_flat / self.pipeline.vae.config.scaling_factor).sample
                 
-                # CLIP similarity loss
-                gen_features = self.pipeline.image_encoder((generated_images + 1) / 2).pooler_output
-                target_features = self.pipeline.image_encoder((target_images_decoded + 1) / 2).pooler_output
+        #         # CLIP similarity loss
+        #         gen_features = self.pipeline.image_encoder((generated_images + 1) / 2).pooler_output
+        #         target_features = self.pipeline.image_encoder((target_images_decoded + 1) / 2).pooler_output
                 
-                perceptual_loss = 1 - F.cosine_similarity(gen_features, target_features, dim=-1).mean()
-                total_loss = denoising_loss + 0.1 * perceptual_loss
-        else:
-            total_loss = denoising_loss
+        #         perceptual_loss = 1 - F.cosine_similarity(gen_features, target_features, dim=-1).mean()
+        #         total_loss = denoising_loss + 0.1 * perceptual_loss
+        # else:
+        #     total_loss = denoising_loss
         
-        return total_loss
-        #return loss
+        # return total_loss
+        return loss
 
 
     def validation_step(self):
@@ -471,7 +488,7 @@ class MVDreamLoRATrainer:
                     global_step += 1
                     
                     logs = {
-                        "train_loss": loss.detach().item(),
+                        "train_loss": loss.detach().item(), # TODO : add perceptual loss
                         "lr": self.lr_scheduler.get_last_lr()[0],
                         "step": global_step,
                     }
