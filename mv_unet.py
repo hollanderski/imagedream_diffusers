@@ -26,15 +26,15 @@ def get_camera(
         
         pose = orbit_camera(-elevation, azimuth, radius=1) # kiui's elevation is negated, [4, 4]
 
-        print(f"Generating camera for azimuth: {azimuth}") 
+        # print(f"Generating camera for azimuth: {azimuth}") 
 
-        print("num frames is ", num_frames)
-        print("angle gap is ", angle_gap)
-        print(f"Raw pose matrix translation: {pose[:3, 3]}")
+        # print("num frames is ", num_frames)
+        # print("angle gap is ", angle_gap)
+        # print(f"Raw pose matrix translation: {pose[:3, 3]}")
     
         # Check azimuth before blender conversion
         raw_azimuth = np.degrees(np.arctan2(pose[0, 3], pose[2, 3])) % 360
-        print(f"Raw azimuth from matrix: {raw_azimuth:.1f}°")
+        #print(f"Raw azimuth from matrix: {raw_azimuth:.1f}°")
 
 
         # opengl to blender
@@ -43,9 +43,9 @@ def get_camera(
             pose[[1, 2]] = pose[[2, 1]]
 
             blender_azimuth = np.degrees(np.arctan2(pose[0, 3], pose[2, 3])) % 360
-            print(f"Blender azimuth from matrix: {blender_azimuth:.1f}°")
-        else:
-            print("no blender")
+            #print(f"Blender azimuth from matrix: {blender_azimuth:.1f}°")
+        #else:
+            #print("no blender")
 
         cameras.append(pose.flatten())
 

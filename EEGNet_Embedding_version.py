@@ -56,7 +56,7 @@ class EEGNet_Embedding(base_model):
         weight_decay = 0.0,
         epochs = 100,
         in_chans = 61,
-        n_classes = 20,
+        n_classes = 6,
         final_conv_length="auto",
         input_window_samples=None,
         #Convolutions and Pooling (depth of spatial conv = F2*D)
@@ -134,7 +134,7 @@ class EEGNet_Embedding(base_model):
         self.bnorm_1 = nn.BatchNorm2d(self.F1 * self.D, momentum=self.momentum, affine=True, eps=1e-3)
         self.elu_1 = Expression(self.activation_fn)
         self.pool_1 = pool_class(kernel_size=(1, 4), stride=(1, 4))
-        print('DROPOUT = ', self.drop_prob)
+        #print('DROPOUT = ', self.drop_prob)
         self.drop_1 = nn.Dropout(p=self.drop_prob)
         self.conv_separable_depth = nn.Conv2d(
             self.F1 * self.D,
@@ -222,11 +222,11 @@ class EEGNet_Embedding(base_model):
             print("embedding None")
             self.embedding = nn.Linear(x.shape[1], 512).to(x.device)
 
-        print(f"Before embedding layer: {x.shape}")
+        #print(f"Before embedding layer: {x.shape}")
 
         embedding  = self.embedding(x) # bs x 1024
 
-        print(f"After embedding layer: {x.shape}")
+        #print(f"After embedding layer: {x.shape}")
 
         if return_embedding:
             return embedding  # Return the 512-dim embedding

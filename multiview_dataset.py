@@ -64,7 +64,7 @@ def sliding_window_data(data, labels, fs, window_length, overlap):
 # Keep the original 4-channel normalize for backward compatibility if needed
 def normalize(img):
     """Ensure output always has 4 channels (RGBA) - DEPRECATED"""
-    print(f"normalize input: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]")
+    #print(f"normalize input: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]")
     
     # Convert to tensor first
     if not isinstance(img, torch.Tensor):
@@ -97,12 +97,12 @@ def normalize(img):
 
     if img.min() >= -1.0 and img.max() <= 1.0:
     # Already normalized, don't normalize again
-        print(f"normalize output: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}] (no renorm needed)")
+        #print(f"normalize output: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}] (no renorm needed)")
         return img
     else:
         # Need to normalize from [0,1] to [-1,1]
         img = img * 2.0 - 1.0
-        print(f"normalize output: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]")
+        #print(f"normalize output: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]")
         return img
     
     # print(f"normalize output: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]")
@@ -178,8 +178,8 @@ class MultiViewEEGDataset():
         self.img_transform_train = transforms.Compose([
             normalize,  # Back to original 4-channel normalize
             transforms.Resize((config.img_size, config.img_size)),
-            random_crop(config.img_size - crop_pix, p=0.5),
-            transforms.Resize((config.img_size, config.img_size)),
+            #random_crop(config.img_size - crop_pix, p=0.5), --> disturb the multiview-consistency
+            #transforms.Resize((config.img_size, config.img_size)),
         ])
 
         self.img_transform_test = transforms.Compose([
@@ -226,7 +226,7 @@ class MultiViewEEGDataset():
         self.group_labels = df['group_label'].values        
         self.group_to_indices = {label: np.where(self.group_labels == label)[0] for label in np.unique(self.group_labels)}
         
-        print(len(self.data), len(self.labels), len(self.group_labels), len(self.trials))
+        #print(len(self.data), len(self.labels), len(self.group_labels), len(self.trials))
         # Create camera embeddings if requested
         if self.camera_embeddings:
             self.camera_poses = self._create_camera_embeddings()
@@ -262,7 +262,7 @@ class MultiViewEEGDataset():
                     image_raw = Image.open(path).convert("RGB")  # FIXED: RGB not RGBA
                     image = np.array(image_raw) / 255.0
                     images[i] = self.image_transform(image)
-                    print("path = ", path)
+                    #print("path = ", path)
                 else:
                     print(f"Warning: Image not found: {path}")
                     # FIXED: Create dummy image with 3 channels and correct size
@@ -284,7 +284,7 @@ class MultiViewEEGDataset():
         Returns:
             List of absolute image indices for the selected views
         """
-        print(f"    _get_view_indices called with base_idx={base_idx}")
+        #print(f"    _get_view_indices called with base_idx={base_idx}")
         
         if self.view_selection == 'sequential':
             # Take consecutive views starting from base_idx
@@ -308,7 +308,7 @@ class MultiViewEEGDataset():
         else:
             raise ValueError(f"Unknown view_selection: {self.view_selection}")
         
-        print(f"    Returning indices: {indices}")
+        #print(f"    Returning indices: {indices}")
         return indices
     
     
@@ -344,20 +344,20 @@ class MultiViewEEGDataset():
         # Use the ORIGINAL calculation with group_label (not my_class)
         base_image_idx = group_label * max_trial * max_view + max_view * my_trial
         
-        print(f"DEBUG idx={idx}: group_label={group_label}, trial_label={trial_label}")
-        print(f"  Parsed: my_class={my_class}, my_trial={my_trial}")
-        print(f"  Base image index: {group_label}*{max_trial}*{max_view} + {max_view}*{my_trial} = {base_image_idx}")
+        #(f"DEBUG idx={idx}: group_label={group_label}, trial_label={trial_label}")
+        #print(f"  Parsed: my_class={my_class}, my_trial={my_trial}")
+        #print(f"  Base image index: {group_label}*{max_trial}*{max_view} + {max_view}*{my_trial} = {base_image_idx}")
         
         # Get indices for multiple views
         view_indices = self._get_view_indices(base_image_idx)
-        print(f"  View indices: {view_indices}")
+        #(f"  View indices: {view_indices}")
         
         # Check what objects these indices point to
-        for i, view_idx in enumerate(view_indices[:2]):  # Just check first 2
-            if view_idx < len(self.image_paths):
-                path = self.image_paths[view_idx]
-                object_name = path.split('/')[-2] if '/' in path else "unknown"
-                print(f"    View {i}: {object_name} ({path.split('/')[-1]})")
+        # for i, view_idx in enumerate(view_indices[:2]):  # Just check first 2
+        #     if view_idx < len(self.image_paths):
+        #         path = self.image_paths[view_idx]
+        #         object_name = path.split('/')[-2] if '/' in path else "unknown"
+        #         print(f"    View {i}: {object_name} ({path.split('/')[-1]})")
         
         # Load images for all views
         images = []
@@ -397,7 +397,7 @@ class MultiViewEEGDataset():
                 # Calculate azimuth from x,z coordinates  
                 azimuth_rad = torch.atan2(cam_pos[0], cam_pos[2])
                 azimuth_deg = torch.rad2deg(azimuth_rad) % 360
-                print(f"View {len(camera_poses)-1}: image_idx={view_idx}, view_offset={view_offset}, camera_azimuth={azimuth_deg:.1f}°")
+                #print(f"View {len(camera_poses)-1}: image_idx={view_idx}, view_offset={view_offset}, camera_azimuth={azimuth_deg:.1f}°")
 
         
         # Stack images and camera poses
@@ -409,8 +409,8 @@ class MultiViewEEGDataset():
             camera_poses = None
 
             
-        print(f"Selected view indices: {view_indices}")
-        print(f"Expected angles: {[(i % 8) * 45 for i in view_indices]}")
+        # print(f"Selected view indices: {view_indices}")
+        # print(f"Expected angles: {[(i % 8) * 45 for i in view_indices]}")
         
         sample = {
             'eeg': self.data[idx].float(),
@@ -661,7 +661,7 @@ if __name__ == "__main__":
     )
     
     # Debug a sample
-    sample = dataset.debug_multiview_sample(idx=0)
+    #sample = dataset.debug_multiview_sample(idx=0)
     
     # Create data loader
     dataloader = create_multiview_dataloader(
@@ -670,19 +670,19 @@ if __name__ == "__main__":
         num_views=4
     )
     
-    # Test visualization
-    print("Testing visualization...")
-    dataset.visualize_sample(idx=1)
-    dataset.visualize_sample(idx=20) 
-    dataset.visualize_sample(idx=100)
-    # Test data loader
-    for batch in dataloader:
-        print("Batch shapes:")
-        print(f"  EEG: {batch['eeg'].shape}")
-        print(f"  Images: {batch['images'].shape}")
-        print(f"  Classes: {batch['classes'].shape}")
-        if batch['camera_poses'] is not None:
-            print(f"  Camera poses: {batch['camera_poses'].shape}")
-        print(f"  Num views: {batch['num_views']}")
-        print(f"  Batch size: {batch['batch_size']}")
-        break
+    # # Test visualization
+    # print("Testing visualization...")
+    # dataset.visualize_sample(idx=1)
+    # dataset.visualize_sample(idx=20) 
+    # dataset.visualize_sample(idx=100)
+    # # Test data loader
+    # for batch in dataloader:
+    #     print("Batch shapes:")
+    #     print(f"  EEG: {batch['eeg'].shape}")
+    #     print(f"  Images: {batch['images'].shape}")
+    #     print(f"  Classes: {batch['classes'].shape}")
+    #     if batch['camera_poses'] is not None:
+    #         print(f"  Camera poses: {batch['camera_poses'].shape}")
+    #     print(f"  Num views: {batch['num_views']}")
+    #     print(f"  Batch size: {batch['batch_size']}")
+    #     break
